@@ -116,10 +116,17 @@ spec aptos_framework::transaction_context {
     spec monotonically_increasing_counter_internal(timestamp_us: u64): u128 {
         //TODO: temporary mockup
         pragma opaque;
+        aborts_if [abstract] false;
     }
 
     spec monotonically_increasing_counter_internal_for_test_only(): u128 {
         //TODO: temporary mockup
         pragma opaque;
+        aborts_if [abstract] false;
+    }
+
+    spec monotonically_increasing_counter(): u128 {
+        pragma opaque;
+        aborts_if [abstract] false;
     }
 }
