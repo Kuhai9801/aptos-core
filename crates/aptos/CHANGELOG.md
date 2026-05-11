@@ -4,7 +4,7 @@ All notable changes to the Aptos CLI will be captured in this file. This project
 
 # Unreleased
 
-- _No changes yet._
+- Set language version 2.4 and bytecode version v10 as default.
 
 ## [9.2.0]
 - Update boogie from 3.5.1 to 3.5.6.
