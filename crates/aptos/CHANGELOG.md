@@ -4,7 +4,7 @@ All notable changes to the Aptos CLI will be captured in this file. This project
 
 # Unreleased
 
-- Added `debug_assert!` macro to the Move v2 compiler (requires Move 2.5). Same forms as `assert!`; active only with `--compile-test-code` and otherwise expands to `()` without evaluating its arguments.
+- Added `debug_assert!`, `debug_assert_eq!`, and `debug_assert_ne!` macros to the Move v2 compiler (requires Move 2.5). Same forms as their non-`debug_` counterparts; active only with `--compile-test-code` and otherwise expand to `()` without evaluating their arguments.
 
 ## [9.2.0]
 - Update boogie from 3.5.1 to 3.5.6.
