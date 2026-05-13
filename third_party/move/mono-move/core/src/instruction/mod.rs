@@ -1231,6 +1231,18 @@ pub const CAPTURED_DATA_TAG_MATERIALIZED: u8 = 0;
 // Future: `CAPTURED_DATA_TAG_RAW: u8 = 1`
 
 impl MicroOp {
+    /// Returns `true` if this op can trigger GC in the current frame.
+    /// TODO: how to ensure this is a complete list?
+    pub fn is_allocating(&self) -> bool {
+        matches!(
+            self,
+            MicroOp::HeapNew { .. }
+                | MicroOp::VecPushBack { .. }
+                | MicroOp::PackClosure(_)
+                | MicroOp::ForceGC
+        )
+    }
+
     // ----- Struct helpers -----
     //
     // Field offsets are byte offsets within the struct's data region, which
