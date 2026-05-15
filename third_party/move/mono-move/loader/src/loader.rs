@@ -25,7 +25,7 @@ use anyhow::{anyhow, bail};
 use mono_move_core::{
     interner::{InternedIdentifier, InternedModuleId},
     types::{InternedType, InternedTypeList},
-    ExecutableId, FieldTypes, FunctionPtr,
+    DescriptorId, ExecutableId, FieldTypes, FrameOffset, FunctionPtr,
 };
 use mono_move_gas::GasMeter;
 use mono_move_global_context::{
@@ -35,8 +35,8 @@ use mono_move_global_context::{
 use shared_dsa::UnorderedSet;
 use specializer::{
     lower::context::{
-        try_lower_function, try_set_lowering_requirements,
-        try_set_lowering_requirements_for_function, SpecializerContext,
+        try_discover_types_for_lowering_in_function, try_discover_types_for_lowering_in_module,
+        try_lower_function, SpecializerContext,
     },
     ModuleIR,
 };
@@ -111,6 +111,11 @@ impl<'guard, 'ctx> Loader<'guard, 'ctx> {
         }
     }
 
+    /// Returns the execution guard this loader is bound to.
+    pub fn guard(&self) -> &'guard ExecutionGuard<'ctx> {
+        self.guard
+    }
+
     /// Loads and returns the executable corresponding to the given ID,
     /// records it (and any policy-dictated mandatory dependencies) in the
     /// transaction's read-set, and charges gas for the load.
@@ -176,7 +181,8 @@ impl<'guard, 'ctx> Loader<'guard, 'ctx> {
         // compute its mandatory set.
         let func_ir = module.get_function_ir(func_name)?;
         let mut loading_ctx = LoweringContext::new(self, read_set);
-        try_set_lowering_requirements_for_function(&mut loading_ctx, module.ir(), func_ir)?;
+        let vec_descriptors =
+            try_discover_types_for_lowering_in_function(&mut loading_ctx, module.ir(), func_ir)?;
 
         let parent_ms_ids = module
             .mandatory_dependencies()
@@ -196,7 +202,7 @@ impl<'guard, 'ctx> Loader<'guard, 'ctx> {
             bail!("All modules are in the read-set");
         })?;
 
-        let function = try_lower_function(module.ir(), func_ir)?;
+        let function = try_lower_function(module.ir(), func_ir, vec_descriptors)?;
         if let Err(loser) = slot.set(FunctionSlot::new(function, function_ms)) {
             // Another thread set the slot first. Free our box and keep
             // the canonical entry.
@@ -431,7 +437,10 @@ impl<'guard, 'ctx> Loader<'guard, 'ctx> {
         walker.discovered_seen.insert(module.id());
         walker.discovered.push(self_slot);
 
-        try_set_lowering_requirements(&mut walker, module.ir())?;
+        // Per-function lowering re-walks types and rebuilds its own
+        // descriptor map; only the side-effecting publish-to-guard
+        // matters here.
+        let _ = try_discover_types_for_lowering_in_module(&mut walker, module.ir())?;
 
         // Set the mandatory set for the module. Because of concurrency, it is
         // possible that other thread sets it at before, so we need to reload
@@ -631,5 +640,17 @@ impl SpecializerContext for LoweringContext<'_, '_, '_> {
         self.loader
             .guard
             .set_nominal_layout(ty, size, align, fields)
+    }
+
+    fn publish_vec_descriptor(
+        &self,
+        elem_ty: InternedType,
+        elem_size: u32,
+        elem_ptr_offsets: &[FrameOffset],
+    ) -> anyhow::Result<DescriptorId> {
+        Ok(self
+            .loader
+            .guard
+            .publish_vec_descriptor(elem_ty, elem_size, elem_ptr_offsets))
     }
 }

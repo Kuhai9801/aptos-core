@@ -16,14 +16,14 @@ use anyhow::{anyhow, Result};
 use mono_move_core::{
     interner::{InternedIdentifier, InternedModuleId},
     types::{FieldLayout, InternedType},
-    FieldTypes,
+    DescriptorId, FieldTypes, FrameOffset,
 };
 use mono_move_global_context::ExecutionGuard;
 use move_binary_format::{access::ModuleAccess, CompiledModule};
 use specializer::{
     destack,
     lower::{
-        context::{try_set_lowering_requirements_for_function, SpecializerContext},
+        context::{try_discover_types_for_lowering_in_function, SpecializerContext},
         gc_layout::derive_frame_layout,
         lower_function, try_build_context, BuildContextOutcome, MicroOpsFunctionDisplay,
     },
@@ -109,16 +109,18 @@ pub fn format_micro_ops(guard: &ExecutionGuard<'_>, module_ir: &ModuleIR) -> Str
 
     for func_ir in module_ir.functions.iter().flatten() {
         let func_name = module.identifier_at(func_ir.name_idx).to_string();
-        if let Err(e) =
-            try_set_lowering_requirements_for_function(&mut loader_ctx, module_ir, func_ir)
-        {
-            out.push_str(&format!(
-                "\nfun {}(): skipped (cannot set lowering requirements: {})\n",
-                func_name, e
-            ));
-            continue;
-        }
-        match try_build_context(module_ir, func_ir) {
+        let vec_descriptors =
+            match try_discover_types_for_lowering_in_function(&mut loader_ctx, module_ir, func_ir) {
+                Ok(map) => map,
+                Err(e) => {
+                    out.push_str(&format!(
+                        "\nfun {}(): skipped (cannot set lowering requirements: {})\n",
+                        func_name, e
+                    ));
+                    continue;
+                },
+            };
+        match try_build_context(module_ir, func_ir, vec_descriptors) {
             Err(e) => {
                 out.push_str(&format!(
                     "\nfun {}(): skipped (context: {})\n",
@@ -173,16 +175,18 @@ pub fn format_frame_layout(guard: &ExecutionGuard<'_>, module_ir: &ModuleIR) -> 
 
     for func_ir in module_ir.functions.iter().flatten() {
         let func_name = module.identifier_at(func_ir.name_idx).to_string();
-        if let Err(e) =
-            try_set_lowering_requirements_for_function(&mut loader_ctx, module_ir, func_ir)
-        {
-            out.push_str(&format!(
-                "fun {}: skipped (cannot set lowering requirements: {})\n",
-                func_name, e
-            ));
-            continue;
-        }
-        match try_build_context(module_ir, func_ir) {
+        let vec_descriptors =
+            match try_discover_types_for_lowering_in_function(&mut loader_ctx, module_ir, func_ir) {
+                Ok(map) => map,
+                Err(e) => {
+                    out.push_str(&format!(
+                        "fun {}: skipped (cannot set lowering requirements: {})\n",
+                        func_name, e
+                    ));
+                    continue;
+                },
+            };
+        match try_build_context(module_ir, func_ir, vec_descriptors) {
             Err(e) => {
                 out.push_str(&format!("fun {}: skipped (context: {})\n", func_name, e));
             },
@@ -247,5 +251,16 @@ impl SpecializerContext for SnapshotLoaderContext<'_, '_, '_> {
         fields: Option<&[FieldLayout]>,
     ) -> Result<()> {
         self.guard.set_nominal_layout(ty, size, align, fields)
+    }
+
+    fn publish_vec_descriptor(
+        &self,
+        elem_ty: InternedType,
+        elem_size: u32,
+        elem_ptr_offsets: &[FrameOffset],
+    ) -> Result<DescriptorId> {
+        Ok(self
+            .guard
+            .publish_vec_descriptor(elem_ty, elem_size, elem_ptr_offsets))
     }
 }

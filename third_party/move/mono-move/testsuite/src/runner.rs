@@ -233,8 +233,7 @@ fn execute_function_v2(
         },
     };
 
-    // TODO: Set object descriptor table when supported.
-    let mut interpreter = InterpreterContext::new(&mut txn_ctx, &[], function);
+    let mut interpreter = InterpreterContext::new(&mut txn_ctx, function);
 
     // TODO: Check function signature to decide how to parse arguments.
     for (i, arg) in args.iter().enumerate() {

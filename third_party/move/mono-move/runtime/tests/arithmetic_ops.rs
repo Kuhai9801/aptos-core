@@ -17,10 +17,10 @@
 
 use mono_move_alloc::GlobalArenaPtr;
 use mono_move_core::{
-    Code, FrameLayoutInfo, FrameOffset as FO, Function, LocalExecutionContext, MicroOp,
-    SortedSafePointEntries, FRAME_METADATA_SIZE,
+    Code, FrameLayoutInfo, FrameOffset as FO, Function, MicroOp, SortedSafePointEntries,
+    FRAME_METADATA_SIZE,
 };
-use mono_move_runtime::{InterpreterContext, ObjectDescriptor};
+use mono_move_runtime::{InterpreterContext, LocalRuntimeContext};
 
 // ---------------------------------------------------------------------------
 // Frame layout used by every test in this file
@@ -58,9 +58,8 @@ fn make_func(op: MicroOp) -> Function {
 /// slots, runs the op + Return, returns the value at `SLOT_DST` (or err).
 fn run_binary_u64_op(op: MicroOp, lhs: u64, rhs: u64) -> Result<u64, anyhow::Error> {
     let func = make_func(op);
-    let descriptors: Vec<ObjectDescriptor> = vec![];
-    let mut exec_ctx = LocalExecutionContext::with_max_budget();
-    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, &func);
+    let mut exec_ctx = LocalRuntimeContext::with_max_budget_no_descriptors();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &func);
     ctx.set_root_arg(SLOT_LHS, &lhs.to_ne_bytes());
     ctx.set_root_arg(SLOT_RHS, &rhs.to_ne_bytes());
     ctx.run()?;
@@ -72,9 +71,8 @@ fn run_binary_u64_op(op: MicroOp, lhs: u64, rhs: u64) -> Result<u64, anyhow::Err
 /// at `SLOT_DST` (or err).
 fn run_unary_u64_op(op: MicroOp, src: u64) -> Result<u64, anyhow::Error> {
     let func = make_func(op);
-    let descriptors: Vec<ObjectDescriptor> = vec![];
-    let mut exec_ctx = LocalExecutionContext::with_max_budget();
-    let mut ctx = InterpreterContext::new(&mut exec_ctx, &descriptors, &func);
+    let mut exec_ctx = LocalRuntimeContext::with_max_budget_no_descriptors();
+    let mut ctx = InterpreterContext::new(&mut exec_ctx, &func);
     ctx.set_root_arg(SLOT_SRC, &src.to_ne_bytes());
     ctx.run()?;
     Ok(ctx.root_result())
