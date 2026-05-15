@@ -6,8 +6,8 @@
 
 use crate::{
     bail,
-    error::ExecutionResult,
     descriptor_provider::DescriptorProvider,
+    error::ExecutionResult,
     heap::{
         macros::{alloc_obj, alloc_vec, gc_collect, grow_vec_ref},
         object_descriptor::CLOSURE_DESCRIPTOR_ID,

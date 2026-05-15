@@ -109,17 +109,20 @@ pub fn format_micro_ops(guard: &ExecutionGuard<'_>, module_ir: &ModuleIR) -> Str
 
     for func_ir in module_ir.functions.iter().flatten() {
         let func_name = module.identifier_at(func_ir.name_idx).to_string();
-        let vec_descriptors =
-            match try_discover_types_for_lowering_in_function(&mut loader_ctx, module_ir, func_ir) {
-                Ok(map) => map,
-                Err(e) => {
-                    out.push_str(&format!(
-                        "\nfun {}(): skipped (cannot set lowering requirements: {})\n",
-                        func_name, e
-                    ));
-                    continue;
-                },
-            };
+        let vec_descriptors = match try_discover_types_for_lowering_in_function(
+            &mut loader_ctx,
+            module_ir,
+            func_ir,
+        ) {
+            Ok(map) => map,
+            Err(e) => {
+                out.push_str(&format!(
+                    "\nfun {}(): skipped (cannot discover types: {})\n",
+                    func_name, e
+                ));
+                continue;
+            },
+        };
         match try_build_context(module_ir, func_ir, vec_descriptors) {
             Err(e) => {
                 out.push_str(&format!(
@@ -175,17 +178,20 @@ pub fn format_frame_layout(guard: &ExecutionGuard<'_>, module_ir: &ModuleIR) -> 
 
     for func_ir in module_ir.functions.iter().flatten() {
         let func_name = module.identifier_at(func_ir.name_idx).to_string();
-        let vec_descriptors =
-            match try_discover_types_for_lowering_in_function(&mut loader_ctx, module_ir, func_ir) {
-                Ok(map) => map,
-                Err(e) => {
-                    out.push_str(&format!(
-                        "fun {}: skipped (cannot set lowering requirements: {})\n",
-                        func_name, e
-                    ));
-                    continue;
-                },
-            };
+        let vec_descriptors = match try_discover_types_for_lowering_in_function(
+            &mut loader_ctx,
+            module_ir,
+            func_ir,
+        ) {
+            Ok(map) => map,
+            Err(e) => {
+                out.push_str(&format!(
+                    "fun {}: skipped (cannot discover types: {})\n",
+                    func_name, e
+                ));
+                continue;
+            },
+        };
         match try_build_context(module_ir, func_ir, vec_descriptors) {
             Err(e) => {
                 out.push_str(&format!("fun {}: skipped (context: {})\n", func_name, e));

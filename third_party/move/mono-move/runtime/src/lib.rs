@@ -14,7 +14,6 @@ mod verifier;
 
 pub use descriptor_provider::DescriptorProvider;
 pub use error::{ExecutionError, ExecutionResult};
-pub use local_runtime_context::LocalRuntimeContext;
 pub use heap::{
     object_descriptor::{
         ObjectDescriptor, ObjectDescriptorTable, CLOSURE_DESCRIPTOR_ID, TRIVIAL_DESCRIPTOR_ID,
@@ -22,6 +21,7 @@ pub use heap::{
     pinned_roots::{PinGuard, PinnedRoots},
 };
 pub use interpreter::InterpreterContext;
+pub use local_runtime_context::LocalRuntimeContext;
 pub use memory::{
     read_ptr, read_u32, read_u64, vec_elem_ptr, write_ptr, write_u32, write_u64, MemoryRegion,
 };
