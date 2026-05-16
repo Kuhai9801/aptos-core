@@ -87,7 +87,7 @@ impl std::fmt::Display for DebugValue {
     }
 }
 
-pub type FieldInfo = (String, Type);
+pub type FieldInfo = (String, Option<Type>);
 
 #[derive(Clone)]
 pub enum AdtInfo {
@@ -245,9 +245,9 @@ fn serialize_fields(
         .map(|(i, fv)| {
             let (fname, field_ty) = field_infos
                 .get(i)
-                .map(|(name, ty)| (name.clone(), Some(ty)))
+                .map(|(name, ty)| (name.clone(), ty.clone()))
                 .unwrap_or_else(|| (format!("[{}]", i), None));
-            (fname, serialize_value(fv, field_ty, resolver))
+            (fname, serialize_value(fv, field_ty.as_ref(), resolver))
         })
         .collect()
 }
@@ -421,7 +421,7 @@ mod tests {
     }
 
     fn names_to_field_infos(names: Vec<String>) -> Vec<FieldInfo> {
-        names.into_iter().map(|n| (n, Type::U8)).collect()
+        names.into_iter().map(|n| (n, None)).collect()
     }
 
     impl TypeNameResolver for MockTypeResolver {

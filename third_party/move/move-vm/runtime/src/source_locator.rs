@@ -221,9 +221,7 @@ fn merge_field_names_and_types(
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let ty = field_types
-                .and_then(|ft| ft.get(i).map(|(_, t)| t.clone()))
-                .unwrap_or(Type::U8);
+            let ty = field_types.and_then(|ft| ft.get(i).map(|(_, t)| t.clone()));
             (name.clone(), ty)
         })
         .collect()
