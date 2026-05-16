@@ -116,6 +116,7 @@ pub fn get_function_param_and_local_names(
 pub struct LocalInfo {
     pub index: usize,
     pub name: String,
+    pub ty: Type,
 }
 
 /// Resolve local variable info for a function using the global source
@@ -130,13 +131,21 @@ pub(crate) fn build_local_infos(function: &crate::LoadedFunction) -> Vec<LocalIn
         .map(|(_, n)| n);
 
     (0..total)
-        .map(|idx| {
+        .map(|local_idx| {
             let name = names
                 .as_ref()
-                .and_then(|n| n.get(idx).cloned())
+                .and_then(|n| n.get(local_idx).cloned())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("local[{}]", idx));
-            LocalInfo { index: idx, name }
+                .unwrap_or_else(|| format!("local[{}]", local_idx));
+            let ty = function
+                .local_tys()
+                .get(local_idx)
+                .expect("local_idx derived from function.local_tys()");
+            LocalInfo {
+                index: local_idx,
+                name,
+                ty: ty.clone(),
+            }
         })
         .collect()
 }
@@ -267,8 +276,7 @@ pub(crate) fn print_locals_enriched<B: fmt::Write>(
 
     let mut printed_header = false;
     for info in &infos[..param_count.min(total)] {
-        let ty = &function.local_tys()[info.index];
-        let dv = serialize_value_for_debug(locals, info.index, ty, &name_resolver);
+        let dv = serialize_value_for_debug(locals, info.index, &info.ty, &name_resolver);
         if compact && matches!(&dv, DebugValue::Invalid) {
             continue;
         }
@@ -282,9 +290,8 @@ pub(crate) fn print_locals_enriched<B: fmt::Write>(
     }
 
     printed_header = false;
-    for info in &infos[param_count..total] {
-        let ty = &function.local_tys()[info.index];
-        let dv = serialize_value_for_debug(locals, info.index, ty, &name_resolver);
+    for info in &infos[param_count..param_count.max(total)] {
+        let dv = serialize_value_for_debug(locals, info.index, &info.ty, &name_resolver);
         if compact && matches!(&dv, DebugValue::Invalid) {
             continue;
         }
