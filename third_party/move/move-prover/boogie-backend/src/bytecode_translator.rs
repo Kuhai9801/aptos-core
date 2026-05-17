@@ -2052,6 +2052,28 @@ impl<'env> BoogieTranslator<'env> {
     }
 
     /// Generate the uninterpreted `result_of` function and its connecting axiom.
+    ///
+    /// The Skolem takes only `(memory, fun, params)` and returns a tuple
+    /// `(declared_results..., &mut post-states...)`. `BehaviorKind::ResultOf`
+    /// and `BehaviorKind::WriteOf(j)` share this symbol — callers project the
+    /// declared-result slice or the j-th post-state slot, respectively. The
+    /// axiom ties it to `ensures_of` by splatting the Skolem's tuple
+    /// components into the corresponding `ensures_of` slots:
+    ///
+    /// ```text
+    /// axiom forall mem, f, p_* ::
+    ///     (var _r := result_of(mem, f, p_*);
+    ///      ensures_of(mem, f, p_*, _r->$0, ..., _r->$<N+K-1>))
+    /// ```
+    ///
+    /// Earlier versions of this generator made the `&mut` post-state slots
+    /// `q_*` *inputs* to `result_of` and universally quantified the axiom over
+    /// them, plus emitted separate `write_of_j` Skolems with functionality
+    /// axioms saying `ensures_of(..., q_*) ==> q_j == write_of_j(inputs)`. The
+    /// two together implied `forall q_j: q_j == write_of_j(inputs)`, which is
+    /// inconsistent for inhabited types. Using a single tuple Skolem keyed on
+    /// inputs alone — matching the per-function Skolem path — eliminates that
+    /// inconsistency at the source.
     fn generate_result_of_function_and_axiom(
         &self,
         fun_type: &Type,
@@ -2065,16 +2087,20 @@ impl<'env> BoogieTranslator<'env> {
         };
         let params_flat = params.clone().flatten();
         let results_flat = results.clone().flatten();
-        let all_outputs = Self::behavioral_output_types(&params_flat, &results_flat);
+        let declared_results: Vec<Type> = results_flat
+            .iter()
+            .map(|ty| ty.skip_reference().clone())
+            .collect();
+        let post_state_types = Self::behavioral_post_state_types(&params_flat);
 
-        if all_outputs.is_empty() {
+        // Nothing to Skolemize when there are no observable outputs.
+        if declared_results.is_empty() && post_state_types.is_empty() {
             return;
         }
 
         let fun_ty_boogie_name = boogie_type(env, fun_type, false);
 
-        // Compute union of all variants' memory for the result_of function.
-        // Must match the evaluator's memory since the axiom references ensures_of.
+        // Memory must match `ensures_of` since the axiom references it.
         let (union_used_memory, union_old_memory) =
             Self::collect_union_memory(env, closure_infos, fun_param_infos, struct_field_infos);
         let (eval_mem_decls, eval_mem_args) =
@@ -2084,24 +2110,31 @@ impl<'env> BoogieTranslator<'env> {
         let ensures_of_name =
             boogie_behavioral_eval_fun_name(env, fun_type, BehaviorKind::EnsuresOf);
 
-        // Parameters: (memory..., fun, params...)
+        // Inputs: memory, fun, p0..pN. No post-state inputs.
         let mut param_decls: Vec<String> = eval_mem_decls;
         param_decls.push(format!("f: {}", fun_ty_boogie_name));
-        let mut param_args: Vec<String> = eval_mem_args;
-        param_args.push("f".to_string());
+        let mut input_args: Vec<String> = eval_mem_args;
+        input_args.push("f".to_string());
         for (pos, ty) in params_flat.iter().enumerate() {
             param_decls.push(format!(
                 "p{}: {}",
                 pos,
                 boogie_type(env, ty.skip_reference(), false)
             ));
-            param_args.push(format!("p{}", pos));
+            input_args.push(format!("p{}", pos));
         }
 
-        let result_type = if all_outputs.len() == 1 {
-            boogie_type(env, &all_outputs[0], false)
+        // Output tuple: declared results followed by `&mut` post-states.
+        // References are stripped — spec predicates work on values.
+        let output_types: Vec<Type> = declared_results
+            .iter()
+            .chain(post_state_types.iter())
+            .cloned()
+            .collect();
+        let result_type = if output_types.len() == 1 {
+            boogie_type(env, &output_types[0], false)
         } else {
-            boogie_type(env, &Type::Tuple(all_outputs.clone()), false)
+            boogie_type(env, &Type::Tuple(output_types.clone()), false)
         };
 
         emitln!(
@@ -2112,35 +2145,39 @@ impl<'env> BoogieTranslator<'env> {
             result_type
         );
 
-        let result_of_call = format!("{}({})", result_of_name, param_args.join(", "));
+        let result_of_call = format!("{}({})", result_of_name, input_args.join(", "));
 
-        let axiom_body = if all_outputs.len() == 1 {
-            format!(
-                "{}({}, {})",
-                ensures_of_name,
-                param_args.join(", "),
-                result_of_call
-            )
+        // ensures_of takes: input_args, then output slots (declared + post-state).
+        let mut ensures_args = input_args.clone();
+        if output_types.len() == 1 {
+            ensures_args.push(result_of_call.clone());
+            let body = format!("{}({})", ensures_of_name, ensures_args.join(", "));
+            emitln!(
+                self.writer,
+                "axiom (forall {} :: {{{}}} {});",
+                param_decls.join(", "),
+                result_of_call,
+                body
+            );
         } else {
-            let tuple_projections: Vec<String> = (0..all_outputs.len())
+            let tuple_projections: Vec<String> = (0..output_types.len())
                 .map(|i| format!("_r->${}", i))
                 .collect();
-            format!(
-                "(var _r := {}; {}({}, {}))",
+            ensures_args.extend(tuple_projections);
+            let body = format!(
+                "(var _r := {}; {}({}))",
                 result_of_call,
                 ensures_of_name,
-                param_args.join(", "),
-                tuple_projections.join(", ")
-            )
-        };
-
-        emitln!(
-            self.writer,
-            "axiom (forall {} :: {{{}}} {});",
-            param_decls.join(", "),
-            result_of_call,
-            axiom_body
-        );
+                ensures_args.join(", ")
+            );
+            emitln!(
+                self.writer,
+                "axiom (forall {} :: {{{}}} {});",
+                param_decls.join(", "),
+                result_of_call,
+                body
+            );
+        }
     }
 
     /// Generate per-function behavioral spec functions for closure target functions.
@@ -2231,7 +2268,12 @@ impl<'env> BoogieTranslator<'env> {
                 );
             }
 
-            // Generate ensures_of with result functions.
+            // The per-variant ensures_of/result_of Skolems keep the old
+            // shape (multi-output Skolem returning declared + post-state).
+            // The procedure-side dispatcher reads `&mut` post-states from
+            // this Skolem's extended tuple. User-facing `result_of` symmetry
+            // is enforced at the per-type evaluator level — see
+            // `generate_result_of_function_and_axiom`.
             let all_result_type_refs =
                 Self::behavioral_output_type_refs(&fun_param_tys, &results_flat);
             let all_result_types: Vec<String> =
@@ -2251,13 +2293,11 @@ impl<'env> BoogieTranslator<'env> {
             let ensures_fun_name =
                 boogie_behavioral_fun_spec_name(self.env, &info.fun, BehaviorKind::EnsuresOf);
 
-            // Build full parameter list including results
             let mut full_param_decls = input_param_decls.clone();
             for (i, result_type) in all_result_types.iter().enumerate() {
                 full_param_decls.push(format!("r{}: {}", i, result_type));
             }
 
-            // Memory + input args combined (for connecting axioms)
             let all_input_arg_names: Vec<String> = {
                 let mut args = mem_args.clone();
                 args.extend(input_args.iter().cloned());
@@ -2265,7 +2305,6 @@ impl<'env> BoogieTranslator<'env> {
             };
 
             if all_result_types.len() == 1 {
-                // Single result: generate result function and define ensures_of
                 let result_fun_name = boogie_behavioral_fun_result_name(self.env, &info.fun, false);
                 emitln!(
                     self.writer,
@@ -2275,7 +2314,6 @@ impl<'env> BoogieTranslator<'env> {
                     all_result_types[0]
                 );
 
-                // Validity axiom
                 let result_fun_app = format!("{}({})", result_fun_name, input_args_str);
                 self.emit_result_validity_axiom(
                     &input_param_decls,
@@ -2284,7 +2322,6 @@ impl<'env> BoogieTranslator<'env> {
                     &precond,
                 );
 
-                // Connecting axiom: result satisfies ensures_of
                 let ensures_body = self.translate_fun_spec_conditions(
                     &fun_env,
                     &closure_spec,
@@ -2292,7 +2329,6 @@ impl<'env> BoogieTranslator<'env> {
                     &info.fun.inst,
                     &inst_old,
                 );
-                // Define ensures_of as inline function using the translated body
                 emitln!(
                     self.writer,
                     "function {{:inline}} {}({}): bool {{ {} }}",
@@ -2301,7 +2337,6 @@ impl<'env> BoogieTranslator<'env> {
                     ensures_body
                 );
 
-                // Connecting axiom: result_fun satisfies ensures_of
                 let ensures_of_with_result = {
                     let mut call_args = all_input_arg_names.clone();
                     call_args.push(format!("{}({})", result_fun_name, input_args_str));
@@ -2319,7 +2354,6 @@ impl<'env> BoogieTranslator<'env> {
                     );
                 }
             } else if all_result_types.len() >= 2 {
-                // Multiple results: generate tuple-returning result function
                 let result_fun_name = boogie_behavioral_fun_result_name(self.env, &info.fun, true);
 
                 let tuple_element_types = Self::deref_output_types(&all_result_type_refs);
@@ -2333,7 +2367,6 @@ impl<'env> BoogieTranslator<'env> {
                     tuple_type
                 );
 
-                // Validity axiom
                 let result_fun_app = format!("{}({})", result_fun_name, input_args_str);
                 self.emit_tuple_result_validity_axiom(
                     &input_param_decls,
@@ -2342,7 +2375,6 @@ impl<'env> BoogieTranslator<'env> {
                     &precond,
                 );
 
-                // Define ensures_of with translated body
                 let ensures_body = self.translate_fun_spec_conditions(
                     &fun_env,
                     &closure_spec,
@@ -2358,7 +2390,6 @@ impl<'env> BoogieTranslator<'env> {
                     ensures_body
                 );
 
-                // Connecting axiom
                 let tuple_projections: Vec<String> = (0..all_result_types.len())
                     .map(|i| format!("_r->${}", i))
                     .collect();
@@ -2385,7 +2416,6 @@ impl<'env> BoogieTranslator<'env> {
                     );
                 }
             } else {
-                // No return values: still translate ensures body for state-change conditions
                 let ensures_body = self.translate_fun_spec_conditions(
                     &fun_env,
                     &closure_spec,
@@ -2421,7 +2451,9 @@ impl<'env> BoogieTranslator<'env> {
                 BehaviorKind::RequiresOf => matches!(c.kind, ConditionKind::Requires),
                 BehaviorKind::AbortsOf => matches!(c.kind, ConditionKind::AbortsIf),
                 BehaviorKind::EnsuresOf => matches!(c.kind, ConditionKind::Ensures),
-                BehaviorKind::ResultOf => false,
+                // ResultOf/WriteOf are uninterpreted Skolems; the axiom in
+                // `generate_result_of_function_and_axiom` ties them to `ensures_of`.
+                BehaviorKind::ResultOf | BehaviorKind::WriteOf(_) => false,
             })
             .collect();
 
@@ -2429,7 +2461,7 @@ impl<'env> BoogieTranslator<'env> {
             return match kind {
                 BehaviorKind::RequiresOf | BehaviorKind::EnsuresOf => "true".to_string(),
                 BehaviorKind::AbortsOf => "false".to_string(),
-                BehaviorKind::ResultOf => "true".to_string(),
+                BehaviorKind::ResultOf | BehaviorKind::WriteOf(_) => "true".to_string(),
             };
         }
 
@@ -2490,7 +2522,8 @@ impl<'env> BoogieTranslator<'env> {
                         BehaviorKind::RequiresOf | BehaviorKind::AbortsOf => {
                             format!("p{}", param_idx)
                         },
-                        BehaviorKind::ResultOf => unreachable!(),
+                        // ResultOf/WriteOf are uninterpreted — no body translated.
+                        BehaviorKind::ResultOf | BehaviorKind::WriteOf(_) => unreachable!(),
                     };
                     result =
                         result.replace(&format!("$Dereference($t{})", param_idx), &current_value);
@@ -2526,7 +2559,7 @@ impl<'env> BoogieTranslator<'env> {
                     format!("({})", translated.join(" || "))
                 }
             },
-            BehaviorKind::ResultOf => return "true".to_string(),
+            BehaviorKind::ResultOf | BehaviorKind::WriteOf(_) => return "true".to_string(),
         };
 
         // Collect intermediate labels from conditions that need existential wrapping.
@@ -2561,7 +2594,7 @@ impl<'env> BoogieTranslator<'env> {
                         BehaviorKind::RequiresOf => matches!(c.kind, ConditionKind::Requires),
                         BehaviorKind::AbortsOf => matches!(c.kind, ConditionKind::AbortsIf),
                         BehaviorKind::EnsuresOf => matches!(c.kind, ConditionKind::Ensures),
-                        BehaviorKind::ResultOf => false,
+                        BehaviorKind::ResultOf | BehaviorKind::WriteOf(_) => false,
                     };
                     if dominated {
                         return false;
@@ -2954,24 +2987,26 @@ impl<'env> BoogieTranslator<'env> {
         args
     }
 
-    /// Behavioral predicates reason over plain values, even when the underlying
-    /// function result is a reference or a `&mut` parameter post-state. Both
-    /// `&T` and `&mut T` are stripped to `T` here so that `result_of<f>(...)`
-    /// has the same Boogie value type as the surrounding spec context's
-    /// auto-derefed `result`.
+    /// Result slot types in the `ensures_of` signature: declared returns
+    /// followed by one slot per `&mut` parameter post-state. References are
+    /// stripped — spec predicates work on values.
     fn behavioral_output_types(params: &[Type], results: &[Type]) -> Vec<Type> {
         let mut outputs = results
             .iter()
-            // Strip ALL references from results — spec predicates work on values, not refs.
             .map(|ty| ty.skip_reference().clone())
             .collect::<Vec<_>>();
-        outputs.extend(
-            params
-                .iter()
-                .filter(|ty| ty.is_mutable_reference())
-                .map(|ty| ty.skip_reference().clone()),
-        );
+        outputs.extend(Self::behavioral_post_state_types(params));
         outputs
+    }
+
+    /// `&mut` parameter post-state slot types (input slots on `result_of`,
+    /// trailing result slots on `ensures_of`).
+    fn behavioral_post_state_types(params: &[Type]) -> Vec<Type> {
+        params
+            .iter()
+            .filter(|ty| ty.is_mutable_reference())
+            .map(|ty| ty.skip_reference().clone())
+            .collect()
     }
 
     fn behavioral_output_type_refs<'a>(params: &'a [Type], results: &'a [Type]) -> Vec<&'a Type> {
@@ -3131,22 +3166,19 @@ impl<'env> BoogieTranslator<'env> {
                 );
             }
 
-            // For ensures_of: generate result functions and define ensures_of in terms of them.
+            // Multi-output Skolem (declared returns + `&mut` post-states).
+            // The procedure dispatcher reads `&mut` post-states from this
+            // Skolem's output tuple. User-facing `result_of` symmetry is
+            // enforced at the per-type evaluator level.
             let all_result_type_refs = Self::behavioral_output_type_refs(&params, &results);
             let all_result_types: Vec<String> = Self::behavioral_output_types(&params, &results)
                 .into_iter()
                 .map(|ty| boogie_type(self.env, &ty, false))
                 .collect();
 
-            // Generate uninterpreted result functions and validity axioms.
-            // For single result: generates `ensures_of_result0(args) : result_type`
-            // For multiple results: generates `ensures_of_results(args) : $Tuple{n} ...`
-            // This is needed to establish witnesses for choice expressions like `choose y where ensures_of<f>(x, y)`.
             let input_args_str = input_args.join(", ");
-
             let precond = Self::validity_precondition(self.env, &params, "arg");
 
-            // Get the ensures_of function name (used in both branches)
             let ensures_fun_name = boogie_behavioral_spec_fun_name(
                 self.env,
                 &info.fun,
@@ -3155,15 +3187,12 @@ impl<'env> BoogieTranslator<'env> {
                 &[],
             );
 
-            // Build full parameter list including results
             let mut full_param_decls = input_param_decls.clone();
             for (i, result_type) in all_result_types.iter().enumerate() {
                 full_param_decls.push(format!("result{}: {}", i, result_type));
             }
 
             if all_result_types.len() == 1 {
-                // Single result: generate simple function ensures_of_result(args) : result_type
-                // all_result_types already has dereferenced types.
                 let result_fun_name = boogie_behavioral_result_fun_name(
                     self.env,
                     &info.fun,
@@ -3179,7 +3208,6 @@ impl<'env> BoogieTranslator<'env> {
                     all_result_types[0]
                 );
 
-                // Validity axiom
                 let result_fun_app = format!("{}({})", result_fun_name, input_args_str);
                 self.emit_result_validity_axiom(
                     &input_param_decls,
@@ -3188,7 +3216,6 @@ impl<'env> BoogieTranslator<'env> {
                     &precond,
                 );
 
-                // Define ensures_of as simple equality
                 let body = format!("{}({}) == result0", result_fun_name, input_args_str);
                 emitln!(
                     self.writer,
@@ -3198,7 +3225,6 @@ impl<'env> BoogieTranslator<'env> {
                     body
                 );
             } else if all_result_types.len() >= 2 {
-                // Multiple results: generate tuple-returning function ensures_of_results(args) : $Tuple{n} ...
                 let result_fun_name = boogie_behavioral_result_fun_name(
                     self.env,
                     &info.fun,
@@ -3218,7 +3244,6 @@ impl<'env> BoogieTranslator<'env> {
                     tuple_type
                 );
 
-                // Validity axiom
                 let result_fun_app = format!("{}({})", result_fun_name, input_args_str);
                 self.emit_tuple_result_validity_axiom(
                     &input_param_decls,
@@ -3227,8 +3252,6 @@ impl<'env> BoogieTranslator<'env> {
                     &precond,
                 );
 
-                // Define ensures_of by unpacking tuple:
-                // (var r := result_fun(args); r->$0 == result0 && r->$1 == result1 && ...)
                 let equality_checks: Vec<String> = (0..all_result_types.len())
                     .map(|i| format!("r->${} == result{}", i, i))
                     .collect();
@@ -3246,9 +3269,6 @@ impl<'env> BoogieTranslator<'env> {
                     body
                 );
             } else {
-                // No return values: generate the real ensures body for state-change conditions.
-                // This is the parameter variant evaluator — it dispatches to the concrete
-                // closure's ensures body which now correctly handles void functions.
                 emitln!(
                     self.writer,
                     "function {{:inline}} {}({}): bool {{ true }}",
@@ -3353,7 +3373,6 @@ impl<'env> BoogieTranslator<'env> {
             }
             let _ = has_memory;
 
-            let input_args_str = input_args.join(", ");
             let precond = Self::validity_precondition(self.env, &params, "arg");
             // Structured memory-arg carrier for the axiom body translator.
             // `render(kind)` dispatches to `(old, old)` for aborts/requires and
@@ -3381,13 +3400,15 @@ impl<'env> BoogieTranslator<'env> {
                 );
             }
 
-            // For ensures_of: generate result functions and define ensures_of in terms of them.
+            // Multi-output Skolem (declared returns + `&mut` post-states).
+            // User-facing symmetry is at the per-type evaluator level.
             let all_result_type_refs = Self::behavioral_output_type_refs(&params, &results);
             let all_result_types: Vec<String> = Self::behavioral_output_types(&params, &results)
                 .into_iter()
                 .map(|ty| boogie_type(self.env, &ty, false))
                 .collect();
 
+            let input_args_str = input_args.join(", ");
             let ensures_fun_name = boogie_struct_field_spec_fun_name(
                 self.env,
                 &info.struct_id,
@@ -3512,7 +3533,6 @@ impl<'env> BoogieTranslator<'env> {
                     &tuple_element_types,
                     &precond,
                 );
-                // TODO: emit_data_invariant_axiom_for_field for multi-result case
                 let equality_checks: Vec<String> = (0..all_result_types.len())
                     .map(|i| format!("r->${} == result{}", i, i))
                     .collect();
