@@ -55,6 +55,12 @@ pub enum RuntimeError {
     #[error("CallClosure: callee has {num_params} params, exceeds 64-bit mask capacity")]
     TooManyClosureParams { num_params: usize },
 
+    #[error("AbortMsg: message is not valid UTF-8")]
+    InvalidAbortMessage,
+
+    #[error("AbortMsg: message size {len} exceeds maximum {max}")]
+    AbortMessageTooLong { len: usize, max: usize },
+
     #[error("invariant violation: {0}")]
     InvariantViolation(#[from] RuntimeInvariantViolation),
 }
@@ -73,13 +79,15 @@ impl IntoExecutionError for RuntimeError {
             | ShiftAmountOutOfRange { .. }
             | PopFromEmptyVector
             | VectorIndexOutOfBounds { .. }
-            | NullClosure => ExecutionErrorKind::InvalidOperation,
+            | NullClosure
+            | InvalidAbortMessage => ExecutionErrorKind::InvalidOperation,
 
             StackOverflow
             | OutOfHeapMemory { .. }
             | AllocationTooLarge { .. }
             | VecAllocSizeOverflow
-            | TooManyClosureParams { .. } => ExecutionErrorKind::RuntimeLimitExceeded,
+            | TooManyClosureParams { .. }
+            | AbortMessageTooLong { .. } => ExecutionErrorKind::RuntimeLimitExceeded,
 
             InvariantViolation(_) => ExecutionErrorKind::InvariantViolation,
         }
@@ -190,6 +198,20 @@ pub enum RuntimeInvariantViolation {
         "CallClosure: {provided} provided_args but only {consumed} non-captured params consumed"
     )]
     ClosureArgsCountMismatch { provided: usize, consumed: usize },
+}
+
+/// Successful terminal outcomes from `Interpreter::run`. Runtime
+/// failures flow through the `Err` channel as [`RuntimeError`] — abort
+/// and failure are structurally separate.
+#[derive(Debug)]
+pub enum RuntimeStatus {
+    Success,
+    // TODO: carry the abort's `Location` (which module raised it) once
+    // we have a `Location` type defined.
+    Aborted {
+        code: u64,
+        message: Option<String>,
+    },
 }
 
 /// Returns from the enclosing function with an [`RuntimeError::InvariantViolation`]

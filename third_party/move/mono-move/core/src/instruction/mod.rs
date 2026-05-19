@@ -448,7 +448,6 @@ pub enum MicroOp {
     // handle "dirty" bools (values other than 0 or 1).
     //
     // May want:
-    // - Abort,
     // - more conditions: ==, !=, >, <=, and const variants,
     // - something for enum dispatch (jump table)?
     //======================================================================
@@ -532,6 +531,19 @@ pub enum MicroOp {
         target: CodeOffset,
         lhs: FrameOffset,
         rhs: FrameOffset,
+    },
+
+    /// Abort the current execution with a u64 abort code, read from
+    /// `code`.
+    Abort { code: FrameOffset },
+
+    /// Abort the current execution with a u64 abort code and a
+    /// `vector<u8>` message read from `message`. The interpreter
+    /// copies the bytes out, validates them as UTF-8, and enforces
+    /// the abort-message size limit.
+    AbortMsg {
+        code: FrameOffset,
+        message: FrameOffset,
     },
 
     //======================================================================
@@ -896,6 +908,12 @@ impl fmt::Display for MicroOp {
             },
             MicroOp::Return => {
                 write!(f, "Return")
+            },
+            MicroOp::Abort { code } => {
+                write!(f, "Abort [{}]", code.0)
+            },
+            MicroOp::AbortMsg { code, message } => {
+                write!(f, "AbortMsg [{}] [{}]", code.0, message.0)
             },
             MicroOp::Jump { target } => {
                 write!(f, "Jump @{}", target.0)

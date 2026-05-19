@@ -16,10 +16,10 @@ use mono_move_core::{types::EMPTY_TYPE_LIST, ExecutionContext};
 use mono_move_gas::SimpleGasMeter;
 use mono_move_global_context::{ExecutionGuard, GlobalContext};
 use mono_move_loader::{Loader, LoadingPolicy, LoweringPolicy, TransactionContext};
-use mono_move_runtime::InterpreterContext;
+use mono_move_runtime::{InterpreterContext, RuntimeStatus};
 use move_core_types::{
     account_address::AccountAddress, identifier::IdentStr, language_storage::ModuleId,
-    value::MoveValue,
+    value::MoveValue, vm_status::StatusCode,
 };
 use move_vm_runtime::{
     data_cache::{MoveVmDataCacheAdapter, TransactionDataCache},
@@ -185,6 +185,17 @@ fn execute_function_v1(
                 num_returns,
             }
         },
+        Err(err) if err.major_status() == StatusCode::ABORTED => {
+            let code = err.sub_status().unwrap();
+            let display = match err.message() {
+                Some(m) => format!("aborted: code {} ({})", code, m),
+                None => format!("aborted: code {}", code),
+            };
+            Output {
+                display,
+                num_returns: 0,
+            }
+        },
         Err(err) => Output {
             display: format!("error: {}", err),
             num_returns: 0,
@@ -249,7 +260,17 @@ fn execute_function_v2(
             display: format!("error: {}", err),
             num_returns: 0,
         },
-        Ok(()) => {
+        Ok(RuntimeStatus::Aborted { code, message }) => {
+            let display = match message {
+                Some(m) => format!("aborted: code {} ({})", code, m),
+                None => format!("aborted: code {}", code),
+            };
+            Output {
+                display,
+                num_returns: 0,
+            }
+        },
+        Ok(RuntimeStatus::Success) => {
             let vals = (0..num_returns)
                 .map(|i| interpreter.root_result_at((i * 8) as u32).to_string())
                 .collect::<Vec<_>>();

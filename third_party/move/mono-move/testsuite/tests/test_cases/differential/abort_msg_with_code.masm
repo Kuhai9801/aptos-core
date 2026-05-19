@@ -1,0 +1,11 @@
+// RUN: publish --print(bytecode,stackless,micro-ops)
+module 0x1::test
+
+public fun do_abort_msg(code: u64)
+    move_loc code
+    ld_const<vector<u8>> [98, 111, 111, 109]
+    abort_msg
+    ret
+
+// RUN: execute 0x1::test::do_abort_msg --args 7
+// CHECK: aborted: code 7 (boom)
