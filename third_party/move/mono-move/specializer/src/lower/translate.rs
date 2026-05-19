@@ -5,23 +5,42 @@
 
 use super::{
     context::{concrete_type_size, LoweringContext, SlotInfo, TypedSlot},
+    gc_layout::append_pointer_offsets,
     parallel_copy,
 };
-use crate::stackless_exec_ir::{BinaryOp, CmpOp, FunctionIR, ImmValue, Instr, Label, Slot};
+use crate::stackless_exec_ir::{
+    instr_utils::{clobbers_xfer, for_each_use},
+    BinaryOp, CmpOp, FunctionIR, ImmValue, Instr, Label, Slot,
+};
 use anyhow::{bail, Context, Result};
 use mono_move_core::{
     types::{strip_ref, view_type, InternedType, Type, EMPTY_TYPE_LIST},
-    CodeOffset, FrameOffset, MicroOp,
+    CodeOffset, FrameLayoutInfo, FrameOffset, MicroOp, SafePointEntry,
 };
 
-pub fn lower_function(func_ir: &FunctionIR, ctx: &LoweringContext) -> Result<Vec<MicroOp>> {
+/// Lower a slot-allocated function to its micro-op form.
+///
+/// Returns `(ops, safe_points)`:
+/// - `ops` — pre-instrumentation micro-ops in emission order.
+/// - `safe_points` — one entry **per allocating micro-op only**,
+///   in code-offset order. Non-allocating PCs are not represented;
+///   the vector is sparse. Each entry's `code_offset` indexes
+///   directly into `ops`.
+pub fn lower_function(
+    func_ir: &FunctionIR,
+    ctx: &LoweringContext,
+) -> Result<(Vec<MicroOp>, Vec<SafePointEntry>)> {
     let mut state = LoweringState::new(func_ir, ctx);
     for block in &func_ir.blocks {
-        // Reset Xfer bindings: Vids are block-local in the post-allocation
-        // IR, so a binding from a previous block can never be a legitimate
-        // read in this one. Wiping makes any accidental cross-block read
-        // surface as an error from `slot()` (via `xfer_binding`) instead
-        // of silently using a stale binding.
+        // Xfer slots are block-local.
+        debug_assert!(
+            state.xfer_bindings.iter().all(Option::is_none),
+            "xfer_bindings not fully cleared at block boundary",
+        );
+        debug_assert!(
+            state.pending_def_bind.is_none(),
+            "pending_def_bind not committed at block boundary",
+        );
         state.xfer_bindings.fill(None);
         state.label_map[block.label.0 as usize] = Some(state.out_buf.len() as u32);
         for instr in &block.instrs {
@@ -29,7 +48,7 @@ pub fn lower_function(func_ir: &FunctionIR, ctx: &LoweringContext) -> Result<Vec
         }
     }
     state.fixup_branches()?;
-    Ok(state.out_buf)
+    Ok((state.out_buf, state.pending_safe_points))
 }
 
 struct LoweringState<'a> {
@@ -54,14 +73,17 @@ struct LoweringState<'a> {
     /// Types of the function IR's home (frame-resident) slots, indexed
     /// by Home slot id.
     home_slot_types: &'a [InternedType],
-    /// Where `Slot::Xfer(j)` currently lives in the caller's frame
-    /// (an arg slot before a call; a ret slot after). `None` means no
-    /// value lives at `j` right now. Length is fixed at
-    /// `ctx.num_xfer_positions`. Each `j` is rebound many times within
-    /// a block as successive calls reuse it; every binding is wiped to
-    /// `None` at block boundaries by `lower_function`, so stale
-    /// cross-block reads error out via `xfer_binding`.
+    /// `Some(TypedSlot)` while `Slot::Xfer(j)` holds a fully-written
+    /// live value visible to the GC; `None` otherwise. Length
+    /// `ctx.num_xfer_positions`.
     xfer_bindings: Vec<Option<TypedSlot>>,
+    /// Holds at most one pending Xfer binding. `Some((j, ts))`
+    /// means `Xfer(j)` is to be bound to typed slot `ts`; `None`
+    /// means no binding is pending.
+    pending_def_bind: Option<(u16, TypedSlot)>,
+    /// Safe-point entries in code-offset order. Populated by `emit`
+    /// when `op.is_allocating()`.
+    pending_safe_points: Vec<SafePointEntry>,
 }
 
 impl<'a> LoweringState<'a> {
@@ -75,6 +97,8 @@ impl<'a> LoweringState<'a> {
             call_site_cursor: 0,
             home_slot_types: &func_ir.home_slot_types,
             xfer_bindings: vec![None; num_xfer_positions],
+            pending_def_bind: None,
+            pending_safe_points: Vec::new(),
         }
     }
 
@@ -91,23 +115,55 @@ impl<'a> LoweringState<'a> {
         })
     }
 
-    /// Resolve slot info for a destination slot. For Xfer slots, binds
-    /// the position to the upcoming call's `arg_slots[j]`.
+    /// Returns layout info for a destination slot. For
+    /// `Slot::Xfer(j)`, stages a pending binding from `Xfer(j)` to
+    /// the typed slot at arg position `j` of the upcoming call.
+    /// Errors if a binding is already staged or for `Slot::Vid`.
     fn def_slot(&mut self, slot: Slot) -> Result<SlotInfo> {
         Ok(match slot {
             Slot::Home(i) => self.ctx.home_slots[i as usize],
             Slot::Xfer(j) => {
-                let cs = &self.ctx.call_sites[self.call_site_cursor];
-                let ts = cs.arg_slots[j as usize];
-                self.xfer_bindings[j as usize] = Some(ts);
-                ts.slot
+                let call_site = &self.ctx.call_sites[self.call_site_cursor];
+                let typed_slot = call_site.arg_slots[j as usize];
+                debug_assert!(
+                    self.pending_def_bind.is_none(),
+                    "second Xfer def_slot in one IR instr",
+                );
+                self.pending_def_bind = Some((j, typed_slot));
+                typed_slot.slot
             },
             Slot::Vid(i) => bail!("Vid({}) in post-allocation IR", i),
         })
     }
 
-    fn emit(&mut self, op: MicroOp) {
+    /// Append `op` to the output buffer. For allocating `op`s,
+    /// also emit a paired `SafePointEntry` whose `code_offset` is
+    /// `op`'s index in the buffer and whose `heap_ptr_offsets`
+    /// are derived from the current `xfer_bindings`.
+    fn emit(&mut self, op: MicroOp) -> Result<()> {
+        if op.is_allocating() {
+            let code_offset = CodeOffset(self.out_buf.len() as u32);
+            let mut heap_ptr_offsets: Vec<FrameOffset> =
+                Vec::with_capacity(self.xfer_bindings.len());
+            for ts in self.xfer_bindings.iter().flatten() {
+                append_pointer_offsets(ts.ty, ts.slot.offset.0, &mut heap_ptr_offsets)
+                    .with_context(|| {
+                        format!(
+                            "deriving safe-point heap pointer offsets at code_offset {}",
+                            code_offset.0
+                        )
+                    })?;
+            }
+            // TODO: revisit the need to sort and dedup.
+            heap_ptr_offsets.sort_by_key(|o| o.0);
+            heap_ptr_offsets.dedup();
+            self.pending_safe_points.push(SafePointEntry {
+                code_offset,
+                layout: FrameLayoutInfo::new(heap_ptr_offsets),
+            });
+        }
         self.out_buf.push(op);
+        Ok(())
     }
 
     /// Interned-type corresponding to `slot`.
@@ -144,22 +200,23 @@ impl<'a> LoweringState<'a> {
     /// Emit one byte-copy from `src` to `dst_offset`. Caller is
     /// responsible for ensuring no other concurrent move clobbers the
     /// source bytes.
-    fn emit_single_move(&mut self, dst_offset: FrameOffset, src: SlotInfo) {
+    fn emit_single_move(&mut self, dst_offset: FrameOffset, src: SlotInfo) -> Result<()> {
         if dst_offset == src.offset {
-            return;
+            return Ok(());
         }
         if src.size == 8 {
             self.emit(MicroOp::Move8 {
                 dst: dst_offset,
                 src: src.offset,
-            });
+            })?;
         } else {
             self.emit(MicroOp::Move {
                 dst: dst_offset,
                 src: src.offset,
                 size: src.size,
-            });
+            })?;
         }
+        Ok(())
     }
 
     /// Lower one IR instruction.
@@ -171,77 +228,77 @@ impl<'a> LoweringState<'a> {
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v,
-                });
+                })?;
             },
             Instr::LdTrue(dst) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: 1,
-                });
+                })?;
             },
             Instr::LdFalse(dst) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: 0,
-                });
+                })?;
             },
             Instr::LdU8(dst, v) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v as u64,
-                });
+                })?;
             },
             Instr::LdU16(dst, v) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v as u64,
-                });
+                })?;
             },
             Instr::LdU32(dst, v) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v as u64,
-                });
+                })?;
             },
             Instr::LdI8(dst, v) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v as u64,
-                });
+                })?;
             },
             Instr::LdI16(dst, v) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v as u64,
-                });
+                })?;
             },
             Instr::LdI32(dst, v) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v as u64,
-                });
+                })?;
             },
             Instr::LdI64(dst, v) => {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::StoreImm8 {
                     dst: dst_info.offset,
                     imm: *v as u64,
-                });
+                })?;
             },
 
             // --- Copy/Move ---
             Instr::Copy(dst, src) | Instr::Move(dst, src) => {
                 let src_info = self.slot(*src)?;
                 let dst_info = self.def_slot(*dst)?;
-                self.emit_single_move(dst_info.offset, src_info);
+                self.emit_single_move(dst_info.offset, src_info)?;
             },
 
             // --- Binary ops ---
@@ -255,16 +312,16 @@ impl<'a> LoweringState<'a> {
                     let lhs = lhs_info.offset;
                     let rhs = rhs_info.offset;
                     match op {
-                        BinaryOp::Add => self.emit(MicroOp::AddU64 { dst, lhs, rhs }),
-                        BinaryOp::Sub => self.emit(MicroOp::SubU64 { dst, lhs, rhs }),
-                        BinaryOp::Mul => self.emit(MicroOp::MulU64 { dst, lhs, rhs }),
-                        BinaryOp::Div => self.emit(MicroOp::DivU64 { dst, lhs, rhs }),
-                        BinaryOp::Mod => self.emit(MicroOp::ModU64 { dst, lhs, rhs }),
-                        BinaryOp::BitAnd => self.emit(MicroOp::BitAndU64 { dst, lhs, rhs }),
-                        BinaryOp::BitOr => self.emit(MicroOp::BitOrU64 { dst, lhs, rhs }),
-                        BinaryOp::BitXor => self.emit(MicroOp::BitXorU64 { dst, lhs, rhs }),
-                        BinaryOp::Shl => self.emit(MicroOp::ShlU64 { dst, lhs, rhs }),
-                        BinaryOp::Shr => self.emit(MicroOp::ShrU64 { dst, lhs, rhs }),
+                        BinaryOp::Add => self.emit(MicroOp::AddU64 { dst, lhs, rhs })?,
+                        BinaryOp::Sub => self.emit(MicroOp::SubU64 { dst, lhs, rhs })?,
+                        BinaryOp::Mul => self.emit(MicroOp::MulU64 { dst, lhs, rhs })?,
+                        BinaryOp::Div => self.emit(MicroOp::DivU64 { dst, lhs, rhs })?,
+                        BinaryOp::Mod => self.emit(MicroOp::ModU64 { dst, lhs, rhs })?,
+                        BinaryOp::BitAnd => self.emit(MicroOp::BitAndU64 { dst, lhs, rhs })?,
+                        BinaryOp::BitOr => self.emit(MicroOp::BitOrU64 { dst, lhs, rhs })?,
+                        BinaryOp::BitXor => self.emit(MicroOp::BitXorU64 { dst, lhs, rhs })?,
+                        BinaryOp::Shl => self.emit(MicroOp::ShlU64 { dst, lhs, rhs })?,
+                        BinaryOp::Shr => self.emit(MicroOp::ShrU64 { dst, lhs, rhs })?,
                         BinaryOp::Cmp(_) | BinaryOp::Or | BinaryOp::And => {
                             bail!("BinaryOp {:?} for u64-sized type not yet lowered", op)
                         },
@@ -284,21 +341,21 @@ impl<'a> LoweringState<'a> {
                     let dst = dst_info.offset;
                     let src = src_info.offset;
                     match op {
-                        BinaryOp::Add => self.emit(MicroOp::AddU64Imm { dst, src, imm: v }),
-                        BinaryOp::Sub => self.emit(MicroOp::SubU64Imm { dst, src, imm: v }),
-                        BinaryOp::Mul => self.emit(MicroOp::MulU64Imm { dst, src, imm: v }),
-                        BinaryOp::Div => self.emit(MicroOp::DivU64Imm { dst, src, imm: v }),
-                        BinaryOp::Mod => self.emit(MicroOp::ModU64Imm { dst, src, imm: v }),
+                        BinaryOp::Add => self.emit(MicroOp::AddU64Imm { dst, src, imm: v })?,
+                        BinaryOp::Sub => self.emit(MicroOp::SubU64Imm { dst, src, imm: v })?,
+                        BinaryOp::Mul => self.emit(MicroOp::MulU64Imm { dst, src, imm: v })?,
+                        BinaryOp::Div => self.emit(MicroOp::DivU64Imm { dst, src, imm: v })?,
+                        BinaryOp::Mod => self.emit(MicroOp::ModU64Imm { dst, src, imm: v })?,
                         BinaryOp::Shl => self.emit(MicroOp::ShlU64Imm {
                             dst,
                             src,
                             imm: shift_imm_u8(imm)?,
-                        }),
+                        })?,
                         BinaryOp::Shr => self.emit(MicroOp::ShrU64Imm {
                             dst,
                             src,
                             imm: shift_imm_u8(imm)?,
-                        }),
+                        })?,
                         // No immediate forms today: BitAnd/BitOr/BitXor and the
                         // Cmp/Or/And ops.
                         BinaryOp::BitAnd
@@ -322,7 +379,7 @@ impl<'a> LoweringState<'a> {
                 self.emit(MicroOp::SlotBorrow {
                     dst: dst_info.offset,
                     local: src_info.offset,
-                });
+                })?;
             },
             Instr::ReadRef(dst, ref_src) => {
                 // TODO: `size` could equivalently come from `dst_info.size`
@@ -336,7 +393,7 @@ impl<'a> LoweringState<'a> {
                     dst: dst_info.offset,
                     ref_ptr: ref_info.offset,
                     size,
-                });
+                })?;
             },
             Instr::WriteRef(ref_dst, src) => {
                 // TODO: `size` could equivalently come from `src_info.size`
@@ -350,7 +407,7 @@ impl<'a> LoweringState<'a> {
                     ref_ptr: ref_info.offset,
                     src: src_info.offset,
                     size,
-                });
+                })?;
             },
 
             // --- Control flow ---
@@ -359,7 +416,7 @@ impl<'a> LoweringState<'a> {
                 self.branch_fixups.push(idx);
                 self.emit(MicroOp::Jump {
                     target: CodeOffset(encode_label(*l)),
-                });
+                })?;
             },
             Instr::BrTrue(Label(l), cond) => {
                 let cond_info = self.slot(*cond)?;
@@ -370,7 +427,7 @@ impl<'a> LoweringState<'a> {
                 self.emit(MicroOp::JumpNotZeroU64 {
                     target: CodeOffset(encode_label(*l)),
                     src: cond_info.offset,
-                });
+                })?;
             },
             Instr::BrFalse(Label(l), cond) => {
                 let cond_info = self.slot(*cond)?;
@@ -382,7 +439,7 @@ impl<'a> LoweringState<'a> {
                     target: CodeOffset(encode_label(*l)),
                     src: cond_info.offset,
                     imm: 1,
-                });
+                })?;
             },
 
             // --- Fused compare+branch ---
@@ -398,29 +455,29 @@ impl<'a> LoweringState<'a> {
                             target: CodeOffset(encode_label(*l)),
                             lhs: lhs_info.offset,
                             rhs: rhs_info.offset,
-                        }),
+                        })?,
                         CmpOp::Ge => self.emit(MicroOp::JumpGreaterEqualU64 {
                             target: CodeOffset(encode_label(*l)),
                             lhs: lhs_info.offset,
                             rhs: rhs_info.offset,
-                        }),
+                        })?,
                         // x > y ↔ y < x
                         CmpOp::Gt => self.emit(MicroOp::JumpLessU64 {
                             target: CodeOffset(encode_label(*l)),
                             lhs: rhs_info.offset,
                             rhs: lhs_info.offset,
-                        }),
+                        })?,
                         // x <= y ↔ y >= x
                         CmpOp::Le => self.emit(MicroOp::JumpGreaterEqualU64 {
                             target: CodeOffset(encode_label(*l)),
                             lhs: rhs_info.offset,
                             rhs: lhs_info.offset,
-                        }),
+                        })?,
                         CmpOp::Neq => self.emit(MicroOp::JumpNotEqualU64 {
                             target: CodeOffset(encode_label(*l)),
                             lhs: lhs_info.offset,
                             rhs: rhs_info.offset,
-                        }),
+                        })?,
                         CmpOp::Eq => {
                             bail!("BrCmp Eq for u64-sized type not yet lowered")
                         },
@@ -441,22 +498,22 @@ impl<'a> LoweringState<'a> {
                             target: CodeOffset(encode_label(*l)),
                             src: src_info.offset,
                             imm: v,
-                        }),
+                        })?,
                         CmpOp::Lt => self.emit(MicroOp::JumpLessU64Imm {
                             target: CodeOffset(encode_label(*l)),
                             src: src_info.offset,
                             imm: v,
-                        }),
+                        })?,
                         CmpOp::Gt => self.emit(MicroOp::JumpGreaterU64Imm {
                             target: CodeOffset(encode_label(*l)),
                             src: src_info.offset,
                             imm: v,
-                        }),
+                        })?,
                         CmpOp::Le => self.emit(MicroOp::JumpLessEqualU64Imm {
                             target: CodeOffset(encode_label(*l)),
                             src: src_info.offset,
                             imm: v,
-                        }),
+                        })?,
                         CmpOp::Eq | CmpOp::Neq => {
                             bail!("BrCmpImm {:?} for u64-sized type not yet lowered", op)
                         },
@@ -492,7 +549,7 @@ impl<'a> LoweringState<'a> {
                     });
                 }
                 parallel_copy::emit_parallel_copy(&mut self.out_buf, &copies, self.ctx.scratch)?;
-                self.emit(MicroOp::Return);
+                self.emit(MicroOp::Return)?;
             },
 
             // --- Vector ---
@@ -502,7 +559,7 @@ impl<'a> LoweringState<'a> {
                 self.emit(MicroOp::VecLen {
                     dst: dst_info.offset,
                     vec_ref: vec_ref_info.offset,
-                });
+                })?;
             },
             Instr::VecImmBorrow(dst, elem_ty, vec_ref, idx)
             | Instr::VecMutBorrow(dst, elem_ty, vec_ref, idx) => {
@@ -516,7 +573,7 @@ impl<'a> LoweringState<'a> {
                     vec_ref: vec_ref_info.offset,
                     idx: idx_info.offset,
                     elem_size,
-                });
+                })?;
             },
             Instr::VecPopBack(dst, elem_ty, vec_ref) => {
                 let elem_size = concrete_type_size(*elem_ty, "vector elem type")?;
@@ -526,7 +583,7 @@ impl<'a> LoweringState<'a> {
                     dst: dst_info.offset,
                     vec_ref: vec_ref_info.offset,
                     elem_size,
-                });
+                })?;
             },
             Instr::VecPack(dst, _elem_ty, _count, elems) => {
                 if !elems.is_empty() {
@@ -535,7 +592,7 @@ impl<'a> LoweringState<'a> {
                 let dst_info = self.def_slot(*dst)?;
                 self.emit(MicroOp::VecNew {
                     dst: dst_info.offset,
-                });
+                })?;
             },
             Instr::VecPushBack(elem_ty, vec_ref, val) => {
                 let elem_size = concrete_type_size(*elem_ty, "vector elem type")?;
@@ -550,11 +607,32 @@ impl<'a> LoweringState<'a> {
                     elem: val_info.offset,
                     elem_size,
                     descriptor_id,
-                });
+                })?;
             },
 
             _ => bail!("instruction {} not yet lowered", instr.opcode_name()),
         }
+
+        // Calls manage their own Xfer state in `lower_call`.
+        if !clobbers_xfer(instr) {
+            // Release Xfer bindings consumed by this instr's uses.
+            for_each_use(instr, |s| {
+                if let Slot::Xfer(j) = s {
+                    self.xfer_bindings[j as usize] = None;
+                }
+            });
+            // Clear-then-commit so an instr that uses and re-defs
+            // the same `Xfer(j)` ends with the new value visible.
+            if let Some((j, ts)) = self.pending_def_bind.take() {
+                self.xfer_bindings[j as usize] = Some(ts);
+            }
+        } else {
+            debug_assert!(
+                self.pending_def_bind.is_none(),
+                "calls must not leave a pending Xfer def bind",
+            );
+        }
+
         Ok(())
     }
 
@@ -619,13 +697,13 @@ impl<'a> LoweringState<'a> {
                 self.emit(MicroOp::Move8 {
                     dst: dst_off,
                     src: arg_info.offset,
-                });
+                })?;
             } else {
                 self.emit(MicroOp::Move {
                     dst: dst_off,
                     src: arg_info.offset,
                     size: arg_info.size,
-                });
+                })?;
             }
         }
 
@@ -634,13 +712,17 @@ impl<'a> LoweringState<'a> {
             func_name: cs.callee_func_name,
             // TODO: connect this to use non-empty lists for generics.
             ty_args: EMPTY_TYPE_LIST,
-        });
+        })?;
         self.call_site_cursor += 1;
 
-        // Place each ret. Xfer rets just bind the slot info — the next
-        // consumer reads from `ret_slots[k]` directly. Home rets copy
-        // out of the ret region into their Home slot (disjoint regions,
-        // never conflict with future arg setup).
+        // Clear all Xfer bindings (calls clobber the entire callee
+        // region). The ret loop below re-binds the positions this
+        // call returns to.
+        self.xfer_bindings.fill(None);
+
+        // Place each ret. Xfer rets are recorded in `xfer_bindings`
+        // immediately — `CallIndirect` has already written the
+        // values.
         for (k, ret_slot) in rets.iter().enumerate() {
             match *ret_slot {
                 Slot::Xfer(j) => {
@@ -649,7 +731,7 @@ impl<'a> LoweringState<'a> {
                 Slot::Home(i) => {
                     let src = cs.ret_slots[k].slot;
                     let dst = self.ctx.home_slots[i as usize];
-                    self.emit_single_move(dst.offset, src);
+                    self.emit_single_move(dst.offset, src)?;
                 },
                 Slot::Vid(_) => bail!("Vid slot in post-allocation IR"),
             }
